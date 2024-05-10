@@ -9,8 +9,11 @@ from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.rate_oracle.sources.ascend_ex_rate_source import AscendExRateSource
 from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
+from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUSRateSource
 from hummingbot.core.rate_oracle.sources.coin_cap_rate_source import CoinCapRateSource
 from hummingbot.core.rate_oracle.sources.coin_gecko_rate_source import CoinGeckoRateSource
+from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source import CoinbaseAdvancedTradeRateSource
+from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
 from hummingbot.core.rate_oracle.sources.gate_io_rate_source import GateIoRateSource
 from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
@@ -20,11 +23,14 @@ from hummingbot.logger import HummingbotLogger
 
 RATE_ORACLE_SOURCES = {
     "binance": BinanceRateSource,
+    "binance_us": BinanceUSRateSource,
     "coin_gecko": CoinGeckoRateSource,
     "coin_cap": CoinCapRateSource,
     "kucoin": KucoinRateSource,
     "ascend_ex": AscendExRateSource,
     "gate_io": GateIoRateSource,
+    "coinbase_advanced_trade": CoinbaseAdvancedTradeRateSource,
+    "cube": CubeRateSource,
 }
 
 
@@ -183,10 +189,18 @@ class RateOracle(NetworkBase):
         prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
+    def set_price(self, pair: str, price: Decimal):
+        """
+        Update keys in self._prices with new prices
+        """
+        self._prices[pair] = price
+
     async def _fetch_price_loop(self):
         while True:
             try:
-                self._prices = await self._source.get_prices(quote_token=self._quote_token)
+                new_prices = await self._source.get_prices(quote_token=self._quote_token)
+                self._prices.update(new_prices)
+
                 if self._prices:
                     self._ready_event.set()
             except asyncio.CancelledError:
