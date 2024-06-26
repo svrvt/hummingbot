@@ -1,15 +1,11 @@
 #!/bin/bash
 hummingmot_sync_upstream() {
-	# git checkout master
 	git remote add upstream git@github.com:hummingbot/hummingbot.git
-	git fetch upstream
-	# git checkout user
-	git stash
+	git fetch upstream master
+	git stash --include-untracked
 	# git stash -a save "message"
-	git merge upstream/master
-	git add .
-	git commit -am "merged upstream/master with user"
-	git remote add origin git@github.com:chikh-chikh/ex_change.git
+	git merge upstream/master user
+	# git commit -am "after merge upstream/master with user"
 	git remote set-head origin user
 	git push
 	git stash pop
