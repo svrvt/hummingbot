@@ -34,7 +34,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.trading_pair: str = "HBOT-USDT"
         self.strategy_config = StrategyV2ConfigBase(markets={self.connector_name: {self.trading_pair}},
                                                     candles_config=[])
-        with patch('asyncio.create_task', return_value=AsyncMock()):
+        with patch('asyncio.create_task', return_value=MagicMock()):
             # Initialize the strategy with mock components
             with patch("hummingbot.strategy.strategy_v2_base.StrategyV2Base.listen_to_executor_actions", return_value=AsyncMock()):
                 with patch('hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator') as MockExecutorOrchestrator:
@@ -93,7 +93,11 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             is_trading=True,
             custom_info={}
         )
-        self.strategy.executors_info = {"controller_1": [executor_1], "controller_2": [executor_2]}
+        # Set up controller_reports with the new structure
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [executor_1], "positions": [], "performance": None},
+            "controller_2": {"executors": [executor_2], "positions": [], "performance": None}
+        }
         self.strategy.closed_executors_buffer = 0
 
         actions = self.strategy.store_actions_proposal()
@@ -101,18 +105,20 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(actions[0].executor_id, "1")
 
     def test_get_executors_by_controller(self):
-        self.strategy.executors_info = {
-            "controller_1": [MagicMock(), MagicMock()],
-            "controller_2": [MagicMock()]
+        # Set up controller_reports with the new structure
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [MagicMock(), MagicMock()], "positions": [], "performance": None},
+            "controller_2": {"executors": [MagicMock()], "positions": [], "performance": None}
         }
 
         executors = self.strategy.get_executors_by_controller("controller_1")
         self.assertEqual(len(executors), 2)
 
     def test_get_all_executors(self):
-        self.strategy.executors_info = {
-            "controller_1": [MagicMock(), MagicMock()],
-            "controller_2": [MagicMock()]
+        # Set up controller_reports with the new structure
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [MagicMock(), MagicMock()], "positions": [], "performance": None},
+            "controller_2": {"executors": [MagicMock()], "positions": [], "performance": None}
         }
 
         executors = self.strategy.get_all_executors()
@@ -266,8 +272,6 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                          ['id',
                           'timestamp',
                           'type',
-                          'close_timestamp',
-                          'close_type',
                           'status',
                           'config',
                           'net_pnl_pct',
@@ -277,6 +281,8 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                           'is_active',
                           'is_trading',
                           'custom_info',
+                          'close_timestamp',
+                          'close_type',
                           'controller_id',
                           'side'])
         self.assertEqual(df.iloc[0]['id'], '2')  # Since the dataframe is sorted by status
@@ -293,17 +299,13 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             global_pnl_quote=Decimal('150'),
             global_pnl_pct=Decimal('15'),
             volume_traded=Decimal('1000'),
-            open_order_volume=Decimal('0'),
-            inventory_imbalance=Decimal('100'),
             close_type_counts={CloseType.TAKE_PROFIT: 10, CloseType.STOP_LOSS: 5}
         )
 
-    @patch("hummingbot.strategy.strategy_v2_base.ScriptStrategyBase.format_status")
-    def test_format_status(self, mock_super_format_status):
+    def test_format_status(self):
         # Mock dependencies
-        original_status = "Super class status"
-        mock_super_format_status.return_value = original_status
-
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
         controller_mock = MagicMock()
         controller_mock.to_format_status.return_value = ["Mock status for controller"]
         self.strategy.controllers = {"controller_1": controller_mock}
@@ -316,32 +318,31 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         mock_report_controller_1.volume_traded = Decimal("1000.00")
         mock_report_controller_1.close_type_counts = {CloseType.TAKE_PROFIT: 10, CloseType.STOP_LOSS: 5}
 
-        # Mocking generate_performance_report for main controller
-        mock_report_main = MagicMock()
-        mock_report_main.realized_pnl_quote = Decimal("200.00")
-        mock_report_main.unrealized_pnl_quote = Decimal("75.00")
-        mock_report_main.global_pnl_quote = Decimal("275.00")
-        mock_report_main.global_pnl_pct = Decimal("15.00")
-        mock_report_main.volume_traded = Decimal("2000.00")
-        mock_report_main.close_type_counts = {CloseType.TAKE_PROFIT: 2, CloseType.STOP_LOSS: 3}
-        self.strategy.executor_orchestrator.generate_performance_report = MagicMock(side_effect=[mock_report_controller_1, mock_report_main])
-        # Mocking get_executors_by_controller for main controller to return an empty list
-        self.strategy.get_executors_by_controller = MagicMock(return_value=[ExecutorInfo(
+        # Mock executor for the table
+        mock_executor = ExecutorInfo(
             id="12312", timestamp=1234567890, status=RunnableStatus.TERMINATED,
             config=self.get_position_config_market_short(), net_pnl_pct=Decimal(0), net_pnl_quote=Decimal(0),
             cum_fees_quote=Decimal(0), filled_amount_quote=Decimal(0), is_active=False, is_trading=False,
-            custom_info={}, type="position_executor", controller_id="main")])
+            custom_info={}, type="position_executor", controller_id="controller_1")
+
+        # Set up controller_reports with the new structure
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [mock_executor],
+                "positions": [],
+                "performance": mock_report_controller_1
+            }
+        }
 
         # Call format_status
         status = self.strategy.format_status()
 
         # Assertions
-        self.assertIn(original_status, status)
         self.assertIn("Mock status for controller", status)
         self.assertIn("Controller: controller_1", status)
-        self.assertIn("Realized PNL (Quote): 100.00", status)
-        self.assertIn("Unrealized PNL (Quote): 50.00", status)
-        self.assertIn("Global PNL (Quote): 150", status)
+        self.assertIn("$100.00", status)  # Check for performance data in the summary table
+        self.assertIn("$50.00", status)
+        self.assertIn("$150.00", status)
 
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()
@@ -352,7 +353,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             Exception,
             asyncio.CancelledError,
         ])
-        self.strategy.executor_orchestrator.execute_actions = AsyncMock()
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
         controller_mock = MagicMock()
         self.strategy.controllers = {"controller_1": controller_mock}
 

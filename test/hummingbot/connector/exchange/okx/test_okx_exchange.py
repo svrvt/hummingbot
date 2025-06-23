@@ -36,6 +36,12 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         return url
 
     @property
+    def latest_single_price_url(self):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.OKX_TICKER_PATH)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        return regex_url
+
+    @property
     def latest_prices_url(self):
         url = web_utils.public_rest_url(path_url=CONSTANTS.OKX_TICKERS_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
@@ -125,7 +131,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         return "INVALID-PAIR", response
 
     @property
-    def latest_prices_request_mock_response(self):
+    def latest_single_price_request_mock_response(self):
         return {
             "code": "0",
             "msg": "",
@@ -146,6 +152,51 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "vol24h": "2222",
                     "sodUtc0": "2222",
                     "sodUtc8": "2222",
+                    "ts": "1597026383085"
+                }
+            ]
+        }
+
+    @property
+    def latest_prices_request_mock_response(self):
+        return {
+            "code": "0",
+            "msg": "",
+            "data": [
+                {
+                    "instType": "SPOT",
+                    "instId": self.trading_pair,
+                    "last": str(self.expected_latest_price),
+                    "lastSz": "0.1",
+                    "askPx": "9999.99",
+                    "askSz": "11",
+                    "bidPx": "8888.88",
+                    "bidSz": "5",
+                    "open24h": "9000",
+                    "high24h": "10000",
+                    "low24h": "8888.88",
+                    "volCcy24h": "2222",
+                    "vol24h": "2222",
+                    "sodUtc0": "0.1",
+                    "sodUtc8": "0.1",
+                    "ts": "1597026383085"
+                },
+                {
+                    "instType": "SPOT",
+                    "instId": self.trading_pair_2,
+                    "last": str(self.expected_latest_price),
+                    "lastSz": "1",
+                    "askPx": "9999.99",
+                    "askSz": "11",
+                    "bidPx": "8888.88",
+                    "bidSz": "5",
+                    "open24h": "9000",
+                    "high24h": "10000",
+                    "low24h": "8888.88",
+                    "volCcy24h": "2222",
+                    "vol24h": "2222",
+                    "sodUtc0": "0.1",
+                    "sodUtc8": "0.1",
                     "ts": "1597026383085"
                 }
             ]
@@ -803,7 +854,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "accFillSz": "323",
                     "fillNotionalUsd": "",
                     "fillTime": "0",
-                    "fillFee": str(self.expected_fill_fee.flat_fees[0].amount),
+                    "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
                     "fillFeeCcy": self.expected_fill_fee.flat_fees[0].token,
                     "execType": "T",
                     "state": "filled",
@@ -863,7 +914,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "accFillSz": "323",
                     "fillNotionalUsd": "",
                     "fillTime": "0",
-                    "fillFee": str(self.expected_fill_fee.flat_fees[0].amount),
+                    "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
                     "fillFeeCcy": self.expected_fill_fee.flat_fees[0].token,
                     "execType": "T",
                     "state": "filled",
@@ -1131,7 +1182,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "slTriggerPxType": "last",
                     "slOrdPx": "",
                     "feeCcy": self.expected_fill_fee.flat_fees[0].token,
-                    "fee": str(self.expected_fill_fee.flat_fees[0].amount),
+                    "fee": str(-self.expected_fill_fee.flat_fees[0].amount),
                     "rebateCcy": "",
                     "rebate": "",
                     "tgtCcy": "",
@@ -1161,7 +1212,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "posSide": "long",
                     "execType": "M",
                     "feeCcy": self.expected_fill_fee.flat_fees[0].token,
-                    "fee": str(self.expected_fill_fee.flat_fees[0].amount),
+                    "fee": str(-self.expected_fill_fee.flat_fees[0].amount),
                     "ts": "1597026383085"
                 },
             ]
@@ -1186,11 +1237,31 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "posSide": "long",
                     "execType": "M",
                     "feeCcy": self.expected_fill_fee.flat_fees[0].token,
-                    "fee": str(self.expected_fill_fee.flat_fees[0].amount),
+                    "fee": str(-self.expected_fill_fee.flat_fees[0].amount),
                     "ts": "1597026383085"
                 },
             ]
         }
+
+    @aioresponses()
+    def test_get_last_trade_prices(self, mock_api):
+        self._simulate_trading_rules_initialized()
+        mock_api.get(self.latest_single_price_url, body=json.dumps(self.latest_single_price_request_mock_response))
+        mock_api.get(self.latest_prices_url, body=json.dumps(self.latest_prices_request_mock_response))
+
+        latest_prices_single = self.async_run_with_timeout(
+            self.exchange.get_last_traded_prices(trading_pairs=[self.trading_pair])
+        )
+        latest_prices_multiple = self.async_run_with_timeout(
+            self.exchange.get_last_traded_prices(trading_pairs=[self.trading_pair, self.trading_pair_2])
+        )
+
+        self.assertEqual(1, len(latest_prices_single))
+        self.assertEqual(self.expected_latest_price, latest_prices_single[self.trading_pair])
+
+        self.assertEqual(2, len(latest_prices_multiple))
+        self.assertEqual(self.expected_latest_price, latest_prices_multiple[self.trading_pair])
+        self.assertEqual(self.expected_latest_price, latest_prices_multiple[self.trading_pair_2])
 
     @aioresponses()
     def test_cancel_order_successfully(self, mock_api):

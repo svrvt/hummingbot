@@ -1,23 +1,25 @@
-from __future__ import annotations
-
 import asyncio
 import importlib
 import inspect
 from decimal import Decimal
-from typing import Callable, Dict, List, Set
+from typing import TYPE_CHECKING, Callable, List
 
-from pydantic import Field, validator
+from pydantic import ConfigDict, Field, field_validator
 
-from hummingbot.client.config.config_data_types import BaseClientModel, ClientFieldData
-from hummingbot.core.data_type.trade_fee import TokenAmount
+from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.core.data_type.common import MarketDict
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
+from hummingbot.strategy_v2.models.position_config import InitialPositionConfig
 from hummingbot.strategy_v2.runnable_base import RunnableBase
 from hummingbot.strategy_v2.utils.common import generate_unique_id
+
+if TYPE_CHECKING:
+    from hummingbot.strategy_v2.executors.data_types import PositionSummary
 
 
 class ControllerConfigBase(BaseClientModel):
@@ -30,46 +32,52 @@ class ControllerConfigBase(BaseClientModel):
         controller_name (str): The name of the trading strategy that the controller will use.
         candles_config (List[CandlesConfig]): A list of configurations for the candles data feed.
     """
-    id: str = Field(
-        default=None,
-        client_data=ClientFieldData(
-            prompt_on_new=False,
-            prompt=lambda mi: "Enter a unique identifier for the controller or leave empty to generate one."
-        ))
+    id: str = Field(default=None,)
     controller_name: str
     controller_type: str = "generic"
     total_amount_quote: Decimal = Field(
         default=100,
-        client_data=ClientFieldData(
-            is_updatable=True,
-            prompt_on_new=True,
-            prompt=lambda mi: "Enter the total amount in quote asset to use for trading (e.g., 1000):"))
-    manual_kill_switch: bool = Field(default=None, client_data=ClientFieldData(is_updatable=True, prompt_on_new=False))
-    candles_config: List[CandlesConfig] = Field(
-        default="binance_perpetual.WLD-USDT.1m.500",
-        client_data=ClientFieldData(
-            is_updatable=True,
-            prompt_on_new=True,
-            prompt=lambda mi: (
-                "Enter candle configs in format 'exchange1.tp1.interval1.max_records:"
-                "exchange2.tp2.interval2.max_records':"
-            )
-        )
+        json_schema_extra={
+            "prompt": "Enter the total amount in quote asset to use for trading (e.g., 1000): ",
+            "prompt_on_new": True,
+            "is_updatable": True
+        }
     )
+    manual_kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    candles_config: List[CandlesConfig] = Field(
+        default=[],
+        json_schema_extra={"is_updatable": True})
+    initial_positions: List[InitialPositionConfig] = Field(
+        default=[],
+        json_schema_extra={
+            "prompt": "Enter initial positions as a list of InitialPositionConfig objects: ",
+            "prompt_on_new": False,
+            "is_updatable": False
+        })
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    @validator('id', pre=True, always=True)
+    @field_validator('id', mode="before")
+    @classmethod
     def set_id(cls, v):
         if v is None or v.strip() == "":
             return generate_unique_id()
         return v
 
-    @validator('candles_config', pre=True)
+    @field_validator('candles_config', mode="before")
+    @classmethod
     def parse_candles_config(cls, v) -> List[CandlesConfig]:
         if isinstance(v, str):
             return cls.parse_candles_config_str(v)
         elif isinstance(v, list):
             return v
         raise ValueError("Invalid type for candles_config. Expected str or List[CandlesConfig]")
+
+    @field_validator('initial_positions', mode="before")
+    @classmethod
+    def parse_initial_positions(cls, v) -> List[InitialPositionConfig]:
+        if isinstance(v, list):
+            return v
+        raise ValueError("Invalid type for initial_positions. Expected List[InitialPositionConfig]")
 
     @staticmethod
     def parse_candles_config_str(v: str) -> List[CandlesConfig]:
@@ -96,7 +104,7 @@ class ControllerConfigBase(BaseClientModel):
                 configs.append(config)
         return configs
 
-    def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    def update_markets(self, markets: MarketDict) -> MarketDict:
         """
         Update the markets dict of the script from the config.
         """
@@ -122,11 +130,13 @@ class ControllerBase(RunnableBase):
     """
     Base class for controllers.
     """
+
     def __init__(self, config: ControllerConfigBase, market_data_provider: MarketDataProvider,
                  actions_queue: asyncio.Queue, update_interval: float = 1.0):
         super().__init__(update_interval=update_interval)
         self.config = config
         self.executors_info: List[ExecutorInfo] = []
+        self.positions_held: List[PositionSummary] = []
         self.market_data_provider: MarketDataProvider = market_data_provider
         self.actions_queue: asyncio.Queue = actions_queue
         self.processed_data = {}
@@ -148,21 +158,15 @@ class ControllerBase(RunnableBase):
         for candles_config in self.config.candles_config:
             self.market_data_provider.initialize_candles_feed(candles_config)
 
-    def get_balance_requirements(self) -> List[TokenAmount]:
-        """
-        Get the balance requirements for the controller.
-        """
-        return []
-
     def update_config(self, new_config: ControllerConfigBase):
         """
         Update the controller configuration. With the variables that in the client_data have the is_updatable flag set
         to True. This will be only available for those variables that don't interrupt the bot operation.
         """
-        for field in self.config.__fields__.values():
-            client_data = field.field_info.extra.get("client_data")
-            if client_data and client_data.is_updatable:
-                setattr(self.config, field.name, getattr(new_config, field.name))
+        for name, field_info in self.config.__class__.model_fields.items():
+            json_schema_extra = field_info.json_schema_extra or {}
+            if json_schema_extra.get("is_updatable", False):
+                setattr(self.config, name, getattr(new_config, name))
 
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():

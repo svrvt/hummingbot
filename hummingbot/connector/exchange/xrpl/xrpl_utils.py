@@ -1,21 +1,19 @@
 import asyncio
 import binascii
+import logging
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from random import randrange
-from typing import Any, Dict, Final, List, Optional, cast
+from typing import Dict, Final, List, Optional, cast
 
-from pydantic import BaseModel, Field, SecretStr, validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from xrpl.asyncio.account import get_next_valid_seq_number
-from xrpl.asyncio.clients import Client, XRPLRequestFailureException
+from xrpl.asyncio.clients import AsyncWebsocketClient, Client, XRPLRequestFailureException
 from xrpl.asyncio.transaction import XRPLReliableSubmissionException
-from xrpl.asyncio.transaction.main import (
-    _LEDGER_OFFSET,
-    _calculate_fee_per_transaction_type,
-    _get_network_id_and_build_version,
-    _tx_needs_networkID,
-)
-from xrpl.models import Request, Response, Transaction, TransactionMetadata, Tx
+from xrpl.asyncio.transaction.main import _LEDGER_OFFSET, _calculate_fee_per_transaction_type, _tx_needs_networkID
+from xrpl.models import Currency, IssuedCurrency, Request, Response, ServerInfo, Transaction, TransactionMetadata, Tx
 from xrpl.models.requests.request import LookupByLedgerRequest, RequestMethod
 from xrpl.models.utils import require_kwargs_on_init
 from xrpl.utils.txn_parser.utils import NormalizedNode, normalize_nodes
@@ -26,13 +24,14 @@ from xrpl.utils.txn_parser.utils.order_book_parser import (
     _get_quality,
     _group_offer_changes_by_account,
 )
-from xrpl.utils.txn_parser.utils.types import AccountOfferChange, AccountOfferChanges, OfferChange
+from xrpl.utils.txn_parser.utils.types import AccountOfferChange, AccountOfferChanges, Balance, OfferChange
 from yaml.representer import SafeRepresenter
 
-from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.client.config.config_validators import validate_with_regex
 from hummingbot.connector.exchange.xrpl import xrpl_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
+from hummingbot.logger import HummingbotLogger
 
 CENTRALIZED = True
 EXAMPLE_PAIR = "XRP-USD"
@@ -125,9 +124,9 @@ def convert_string_to_hex(s, padding: bool = True):
     return s
 
 
-def get_token_from_changes(token_changes: [Dict[str, Any]], token: str) -> Optional[Dict[str, Any]]:
+def get_token_from_changes(token_changes: List[Balance], token: str) -> Optional[Balance]:
     for token_change in token_changes:
-        if token_change.get("currency") == token:
+        if token_change["currency"] == token:
             return token_change
     return None
 
@@ -140,7 +139,7 @@ class XRPLMarket(BaseModel):
     trading_pair_symbol: Optional[str] = None
 
     def __repr__(self):
-        return str(self.dict())
+        return str(self.model_dump())
 
     def get_token_symbol(self, code: str, issuer: str) -> Optional[str]:
         if self.trading_pair_symbol is None:
@@ -178,6 +177,31 @@ class Ledger(Request, LookupByLedgerRequest):
     queue: bool = False
 
 
+async def get_network_id_and_build_version(client: Client) -> None:
+    """
+    Get the network id and build version of the connected server.
+
+    Args:
+        client: The network client to use to send the request.
+
+    Raises:
+        XRPLRequestFailureException: if the rippled API call fails.
+    """
+    # the required values are already present, no need for further processing
+    if client.network_id and client.build_version:
+        return
+
+    response = await client._request_impl(ServerInfo())
+    if response.is_successful():
+        if "network_id" in response.result["info"]:
+            client.network_id = response.result["info"]["network_id"]
+        if not client.build_version and "build_version" in response.result["info"]:
+            client.build_version = response.result["info"]["build_version"]
+        return
+
+    raise XRPLRequestFailureException(response.result)
+
+
 async def autofill(
     transaction: Transaction, client: Client, signers_count: Optional[int] = None, try_count: int = 0
 ) -> Transaction:
@@ -198,7 +222,7 @@ async def autofill(
     try:
         transaction_json = transaction.to_dict()
         if not client.network_id:
-            await _get_network_id_and_build_version(client)
+            await get_network_id_and_build_version(client)
         if "network_id" not in transaction_json and _tx_needs_networkID(client):
             transaction_json["network_id"] = client.network_id
         if "sequence" not in transaction_json:
@@ -250,6 +274,10 @@ async def get_latest_validated_ledger_sequence(client: Client) -> int:
 _LEDGER_CLOSE_TIME: Final[int] = 1
 
 
+async def _sleep(seconds: int):
+    await asyncio.sleep(seconds)
+
+
 async def _wait_for_final_transaction_outcome(
     transaction_hash: str, client: Client, prelim_result: str, last_ledger_sequence: int
 ) -> Response:
@@ -259,15 +287,14 @@ async def _wait_for_final_transaction_outcome(
     validated ledger, or the transaction's LastLedgerSequence has been surpassed by the
     latest ledger sequence (meaning it will never be included in a validated ledger).
     """
-    await asyncio.sleep(_LEDGER_CLOSE_TIME)
+    await _sleep(_LEDGER_CLOSE_TIME)
 
     current_ledger_sequence = await get_latest_validated_ledger_sequence(client)
 
-    if current_ledger_sequence >= last_ledger_sequence:
+    if current_ledger_sequence >= last_ledger_sequence and (current_ledger_sequence - last_ledger_sequence) > 10:
         raise XRPLReliableSubmissionException(
-            f"The latest validated ledger sequence {current_ledger_sequence} is "
-            f"greater than LastLedgerSequence {last_ledger_sequence} in "
-            f"the transaction. Prelim result: {prelim_result}"
+            f"Transaction failed - latest ledger {current_ledger_sequence} exceeds "
+            f"transaction's LastLedgerSequence {last_ledger_sequence}. Prelim result: {prelim_result}"
         )
 
     # query transaction by hash
@@ -296,46 +323,91 @@ async def _wait_for_final_transaction_outcome(
     return await _wait_for_final_transaction_outcome(transaction_hash, client, prelim_result, last_ledger_sequence)
 
 
+# AMM Interfaces
+class PoolInfo(BaseModel):
+    address: str
+    base_token_address: Currency
+    quote_token_address: Currency
+    lp_token_address: IssuedCurrency
+    fee_pct: Decimal
+    price: Decimal
+    base_token_amount: Decimal
+    quote_token_amount: Decimal
+    lp_token_amount: Decimal
+    pool_type: Optional[str] = None
+
+
+class GetPoolInfoRequest(BaseModel):
+    network: Optional[str] = None
+    pool_address: str
+
+
+class AddLiquidityRequest(BaseModel):
+    network: Optional[str] = None
+    wallet_address: str
+    pool_address: str
+    base_token_amount: Decimal
+    quote_token_amount: Decimal
+    slippage_pct: Optional[Decimal] = None
+
+
+class AddLiquidityResponse(BaseModel):
+    signature: str
+    fee: Decimal
+    base_token_amount_added: Decimal
+    quote_token_amount_added: Decimal
+
+
+class QuoteLiquidityRequest(BaseModel):
+    network: Optional[str] = None
+    pool_address: str
+    base_token_amount: Decimal
+    quote_token_amount: Decimal
+    slippage_pct: Optional[Decimal] = None
+
+
+class QuoteLiquidityResponse(BaseModel):
+    base_limited: bool
+    base_token_amount: Decimal
+    quote_token_amount: Decimal
+    base_token_amount_max: Decimal
+    quote_token_amount_max: Decimal
+
+
+class RemoveLiquidityRequest(BaseModel):
+    network: Optional[str] = None
+    wallet_address: str
+    pool_address: str
+    percentage_to_remove: Decimal
+
+
+class RemoveLiquidityResponse(BaseModel):
+    signature: str
+    fee: Decimal
+    base_token_amount_removed: Decimal
+    quote_token_amount_removed: Decimal
+
+
 class XRPLConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="xrpl", const=True, client_data=None)
+    connector: str = "xrpl"
     xrpl_secret_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your XRPL wallet secret key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        ),
+        json_schema_extra={
+            "prompt": "Enter your XRPL wallet secret key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
     )
 
-    wss_node_url = Field(
-        default="wss://xrplcluster.com/",
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your XRPL Websocket Node URL",
-            is_secure=False,
-            is_connect_key=True,
-            prompt_on_new=True,
-        ),
-    )
-
-    wss_second_node_url = Field(
-        default="wss://s1.ripple.com/",
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your second XRPL Websocket Node URL",
-            is_secure=False,
-            is_connect_key=True,
-            prompt_on_new=True,
-        ),
-    )
-
-    wss_third_node_url = Field(
-        default="wss://s2.ripple.com/",
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your third XRPL Websocket Node URL",
-            is_secure=False,
-            is_connect_key=True,
-            prompt_on_new=True,
-        ),
+    wss_node_urls: list[str] = Field(
+        default=["wss://xrplcluster.com/", "wss://s1.ripple.com/", "wss://s2.ripple.com/"],
+        json_schema_extra={
+            "prompt": "Enter a list of XRPL Websocket Node URLs (comma separated)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
     )
 
     custom_markets: Dict[str, XRPLMarket] = Field(
@@ -347,49 +419,403 @@ class XRPLConfigMap(BaseConnectorConfigMap):
                 quote_issuer="",
             )
         },
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter custom markets: ", is_connect_key=True, prompt_on_new=False
-        ),
     )
 
-    class Config:
-        title = "xrpl"
+    max_request_per_minute: int = Field(
+        default=12,
+        json_schema_extra={
+            "prompt": "Maximum number of requests per minute to XRPL to avoid rate limits",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
 
-    @validator("xrpl_secret_key", pre=True)
-    def validate_xrpl_secret_key(cls, v: str):
-        pattern = r"^s[A-HJ-NP-Za-km-z1-9]*$"
-        error_message = "Invalid XRPL wallet secret key. Secret key should be a base 58 string and start with 's'."
-        ret = validate_with_regex(v, pattern, error_message)
-        if ret is not None:
-            raise ValueError(ret)
-        return v
+    model_config = ConfigDict(title="xrpl")
 
-    @validator("wss_node_url", pre=True)
-    def validate_wss_node_url(cls, v: str):
+    @field_validator("wss_node_urls", mode="before")
+    @classmethod
+    def validate_wss_node_urls(cls, v):
+        if isinstance(v, str):
+            v = [url.strip() for url in v.split(",") if url.strip()]
         pattern = r"^(wss://)[\w.-]+(:\d+)?(/[\w.-]*)*$"
         error_message = "Invalid node url. Node url should be in websocket format."
-        ret = validate_with_regex(v, pattern, error_message)
-        if ret is not None:
-            raise ValueError(ret)
-        return v
-
-    @validator("wss_second_node_url", pre=True)
-    def validate_wss_second_node_url(cls, v: str):
-        pattern = r"^(wss://)[\w.-]+(:\d+)?(/[\w.-]*)*$"
-        error_message = "Invalid node url. Node url should be in websocket format."
-        ret = validate_with_regex(v, pattern, error_message)
-        if ret is not None:
-            raise ValueError(ret)
-        return v
-
-    @validator("wss_third_node_url", pre=True)
-    def validate_wss_third_node_url(cls, v: str):
-        pattern = r"^(wss://)[\w.-]+(:\d+)?(/[\w.-]*)*$"
-        error_message = "Invalid node url. Node url should be in websocket format."
-        ret = validate_with_regex(v, pattern, error_message)
-        if ret is not None:
-            raise ValueError(ret)
+        for url in v:
+            ret = validate_with_regex(url, pattern, error_message)
+            if ret is not None:
+                raise ValueError(f"{ret}: {url}")
+        if not v:
+            raise ValueError("At least one XRPL node URL must be provided.")
         return v
 
 
-KEYS = XRPLConfigMap.construct()
+KEYS = XRPLConfigMap.model_construct()
+
+
+class RateLimiter:
+    _logger = None
+
+    def __init__(self, requests_per_10s: float, burst_tokens: int = 0, max_burst_tokens: int = 5):
+        """
+        Simple rate limiter that measures and controls request rate in 10-second batches.
+
+        Args:
+            requests_per_10s: Maximum requests allowed per 10 seconds
+            burst_tokens: Initial number of burst tokens available
+            max_burst_tokens: Maximum number of burst tokens that can be accumulated
+        """
+        self._rate_limit = requests_per_10s
+        self._max_burst_tokens = max_burst_tokens
+        self._burst_tokens = min(burst_tokens, max_burst_tokens)  # Ensure initial tokens don't exceed max
+        self._request_times = deque(maxlen=1000)  # Store request timestamps for rate calculation
+        self._last_rate_log = time.time()
+        self._rate_log_interval = 10.0  # Log rate every 10 seconds
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(HummingbotLogger.logger_name_for_class(cls))
+        return cls._logger
+
+    def _calculate_current_rate(self) -> float:
+        """Calculate current request rate in requests per 10 seconds"""
+        now = time.time()
+        # Remove timestamps older than 10 seconds
+        while self._request_times and now - self._request_times[0] > 10:
+            self._request_times.popleft()
+
+        if not self._request_times:
+            return 0.0
+
+        # Calculate rate over the last 10 seconds
+        time_span = min(10.0, now - self._request_times[0])
+        if time_span == 0:
+            return 0.0
+
+        # Use a more stable rate calculation that won't produce extreme values
+        # Cap the time_span to prevent division by very small numbers
+        min_time_span = 0.1  # Minimum 100ms window
+        effective_time_span = max(time_span, min_time_span)
+        return len(self._request_times) * 10.0 / effective_time_span
+
+    def _log_rate_status(self):
+        """Log current rate status"""
+        now = time.time()
+        current_rate = self._calculate_current_rate()
+
+        # Only log periodically to avoid spam
+        if now - self._last_rate_log >= self._rate_log_interval:
+            self.logger().debug(
+                f"Rate status: {current_rate:.1f} req/10s (actual), "
+                f"{self._rate_limit:.1f} req/10s (limit), "
+                f"Burst tokens: {self._burst_tokens}/{self._max_burst_tokens}"
+            )
+            self._last_rate_log = now
+
+    async def acquire(self, use_burst: bool = False) -> float:
+        """
+        Acquire permission to make a request. Returns wait time needed.
+
+        Args:
+            use_burst: Whether to use a burst token if available
+
+        Returns:
+            Wait time in seconds before proceeding (0 if no wait needed)
+        """
+        now = time.time()
+        self._request_times.append(now)
+        current_rate = self._calculate_current_rate()
+
+        # If using burst token and tokens available, bypass rate limit
+        if use_burst and self._burst_tokens > 0:
+            self._burst_tokens -= 1
+            self._log_rate_status()
+            return 0.0
+
+        # If under rate limit, proceed immediately
+        if current_rate < self._rate_limit:
+            self._log_rate_status()
+            return 0.0
+
+        # Calculate wait time needed to get under rate limit
+        # We need to wait until enough old requests expire
+        wait_time = 10.0 * (current_rate - self._rate_limit) / current_rate
+        self._log_rate_status()
+        return wait_time
+
+    def add_burst_tokens(self, tokens: int):
+        """Add burst tokens that can be used to bypass rate limits"""
+        if tokens <= 0:
+            self.logger().warning(f"Attempted to add {tokens} burst tokens (must be positive)")
+            return
+
+        new_total = self._burst_tokens + tokens
+        if new_total > self._max_burst_tokens:
+            self._burst_tokens = self._max_burst_tokens
+        else:
+            self._burst_tokens = new_total
+            self.logger().debug(f"Added {tokens} burst tokens. Total: {self._burst_tokens}")
+
+    @property
+    def burst_tokens(self) -> int:
+        """Get current number of burst tokens available"""
+        return self._burst_tokens
+
+
+class XRPLNodePool:
+    _logger = None
+    DEFAULT_NODES = ["wss://xrplcluster.com/", "wss://s1.ripple.com/", "wss://s2.ripple.com/"]
+
+    def __init__(
+        self,
+        node_urls: list[str],
+        requests_per_10s: float = 18,  # About 2 requests per second
+        burst_tokens: int = 0,
+        max_burst_tokens: int = 5,
+        proactive_switch_interval: int = 30,
+        cooldown: int = 600,
+    ):
+        """
+        Initialize XRPLNodePool with rate limiting.
+
+        Args:
+            node_urls: List of XRPL node URLs
+            requests_per_10s: Maximum requests allowed per 10 seconds
+            burst_tokens: Initial number of burst tokens available
+            max_burst_tokens: Maximum number of burst tokens that can be accumulated
+            proactive_switch_interval: Seconds between proactive node switches (0 to disable)
+            cooldown: Seconds a node is considered bad after being rate-limited
+        """
+        if not node_urls or len(node_urls) == 0:
+            node_urls = self.DEFAULT_NODES.copy()
+        self._nodes = deque(node_urls)
+        self._bad_nodes = {}  # url -> timestamp when it becomes good again
+        self._lock = asyncio.Lock()
+        self._last_switch_time = time.time()
+        self._proactive_switch_interval = proactive_switch_interval
+        self._cooldown = cooldown
+        self._current_node = self._nodes[0]
+        self._last_used_node = self._current_node
+        self._init_time = time.time()
+
+        # Initialize rate limiter
+        self._rate_limiter = RateLimiter(
+            requests_per_10s=requests_per_10s,
+            burst_tokens=burst_tokens,
+            max_burst_tokens=max_burst_tokens,
+        )
+        self.logger().info(
+            f"Initialized XRPLNodePool with {len(node_urls)} nodes, "
+            f"rate limit: {requests_per_10s} req/10s, "
+            f"burst tokens: {burst_tokens}/{max_burst_tokens}"
+        )
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(HummingbotLogger.logger_name_for_class(cls))
+        return cls._logger
+
+    async def get_node(self, use_burst: bool = True) -> str:
+        """
+        Get a node URL to use, respecting rate limits and node health.
+        This will wait if necessary to respect rate limits.
+
+        Args:
+            use_burst: Whether to use a burst token if available
+
+        Returns:
+            A node URL to use
+        """
+        async with self._lock:
+            now = time.time()
+
+            # Remove nodes from bad list if cooldown expired
+            self._bad_nodes = {
+                url: until for url, until in self._bad_nodes.items() if isinstance(until, (int, float)) and until > now
+            }
+
+            # Proactive switch if interval passed or current node is bad
+            if (
+                self._proactive_switch_interval > 0 and now - self._last_switch_time > self._proactive_switch_interval
+            ) or self._current_node in self._bad_nodes:
+                self.logger().debug(f"Switching node: proactive or current node is bad. Current: {self._current_node}")
+                await self._rotate_node_locked(now)
+
+            if time.time() - self._init_time > 40:
+                # Wait for rate limiter if needed
+                wait_time = await self._rate_limiter.acquire(use_burst)
+                self.logger().debug(f"Rate limited: waiting {wait_time:.2f}s")
+                await asyncio.sleep(wait_time)
+
+            return self._current_node
+
+    def mark_bad_node(self, url: str):
+        """Mark a node as bad for cooldown seconds"""
+        until = float(time.time() + self._cooldown)
+        self._bad_nodes[url] = until
+        self.logger().info(f"Node marked as bad: {url} (cooldown until {until})")
+        if url == self._current_node:
+            self.logger().debug(f"Current node {url} is bad, rotating node.")
+            asyncio.create_task(self._rotate_node_locked(time.time()))
+
+    async def get_latency(self, node: str) -> float:
+        """Get the latency of a node"""
+        try:
+            client = AsyncWebsocketClient(node)
+            start_time = time.time()
+            await client.open()
+            await client._request_impl(ServerInfo())
+            latency = time.time() - start_time
+            await client.close()
+            return latency
+        except Exception as e:
+            self.logger().error(f"Error getting latency for node {node}: {e}")
+            return 9999
+
+    async def _get_latency_safe(self, node: str) -> float:
+        """Get latency of a node without marking it as bad if it fails"""
+        try:
+            client = AsyncWebsocketClient(node)
+            start_time = time.time()
+            await client.open()
+            await client._request_impl(ServerInfo())
+            latency = time.time() - start_time
+            await client.close()
+            return latency
+        except Exception as e:
+            self.logger().debug(f"Error getting latency for node {node} during rotation: {e}")
+            return 9999
+
+    async def _rotate_node_locked(self, now: float):
+        """Rotate to the next good node"""
+        checked_nodes = set()
+        while len(checked_nodes) < len(self._nodes):
+            self._nodes.rotate(-1)
+            candidate = self._nodes[0]
+
+            # Skip if we've already checked this node
+            if candidate in checked_nodes:
+                continue
+            checked_nodes.add(candidate)
+
+            # Skip if node is in bad list and cooldown hasn't expired
+            if candidate in self._bad_nodes:
+                cooldown_until = self._bad_nodes[candidate]
+                if isinstance(cooldown_until, (int, float)) and cooldown_until > now:
+                    self.logger().debug(f"Skipping node {candidate} - still in cooldown until {cooldown_until}")
+                    continue
+                else:
+                    # Cooldown expired, remove from bad nodes
+                    self._bad_nodes.pop(candidate, None)
+                    self.logger().debug(f"Node {candidate} cooldown expired, removing from bad nodes")
+
+            # Check latency
+            latency = await self._get_latency_safe(candidate)
+            if latency >= 9999 or latency > 5.0:  # 5 seconds max acceptable latency
+                self.logger().warning(f"Node {candidate} has high latency ({latency:.2f}s), marking as bad")
+                self.mark_bad_node(candidate)
+                continue
+
+            # Found a good node
+            self.logger().info(f"Rotated to new XRPL node: {candidate} (latency: {latency:.2f}s)")
+            self._current_node = candidate
+            self._last_switch_time = now
+            return
+
+        # If we get here, all nodes are bad
+        self.logger().warning("All nodes have high latency or are marked as bad, using first node as fallback")
+        self._current_node = self._nodes[0]
+        self._last_switch_time = now
+
+    @property
+    def current_node(self) -> str:
+        return self._current_node
+
+    def add_burst_tokens(self, tokens: int):
+        """Add burst tokens that can be used to bypass rate limits"""
+        self._rate_limiter.add_burst_tokens(tokens)
+
+    @property
+    def burst_tokens(self) -> int:
+        """Get current number of burst tokens available"""
+        return self._rate_limiter.burst_tokens
+
+
+def parse_offer_create_transaction(tx: dict) -> dict:
+    """
+    Helper to parse an OfferCreate transaction and its metadata to extract price (quality) and quantity transferred.
+    Args:
+        tx: The transaction object (dict) as returned by XRPL.
+    Returns:
+        dict with keys: 'quality', 'taker_gets_transferred', 'taker_pays_transferred'
+    """
+    meta = tx.get("meta")
+    if not meta or "AffectedNodes" not in meta:
+        return {"quality": None, "taker_gets_transferred": None, "taker_pays_transferred": None}
+
+    # Find the Offer node for the account and sequence in the transaction
+    account = tx.get("Account")
+    sequence = tx.get("Sequence")
+    offer_node = None
+    for node in meta["AffectedNodes"]:
+        node_type = next(iter(node))
+        node_data = node[node_type]
+        if node_data.get("LedgerEntryType") == "Offer":
+            fields = node_data.get("FinalFields", node_data.get("NewFields", {}))
+            if fields.get("Account") == account and fields.get("Sequence") == sequence:
+                offer_node = node_data
+                break
+    # If not found, just use the first Offer node
+    if offer_node is None:
+        for node in meta["AffectedNodes"]:
+            node_type = next(iter(node))
+            node_data = node[node_type]
+            if node_data.get("LedgerEntryType") == "Offer":
+                offer_node = node_data
+                break
+    # Compute transferred amounts from PreviousFields if available
+    taker_gets_transferred = None
+    taker_pays_transferred = None
+    quality = None
+    if offer_node:
+        prev = offer_node.get("PreviousFields", {})
+        final = offer_node.get("FinalFields", offer_node.get("NewFields", {}))
+        gets_prev = prev.get("TakerGets")
+        gets_final = final.get("TakerGets")
+        pays_prev = prev.get("TakerPays")
+        pays_final = final.get("TakerPays")
+        # Only compute if both prev and final exist
+        if gets_prev is not None and gets_final is not None:
+            try:
+                if isinstance(gets_prev, dict):
+                    gets_prev_val = float(gets_prev["value"])
+                    gets_final_val = float(gets_final["value"])
+                else:
+                    gets_prev_val = float(gets_prev)
+                    gets_final_val = float(gets_final)
+                taker_gets_transferred = gets_prev_val - gets_final_val
+            except Exception:
+                taker_gets_transferred = None
+        if pays_prev is not None and pays_final is not None:
+            try:
+                if isinstance(pays_prev, dict):
+                    pays_prev_val = float(pays_prev["value"])
+                    pays_final_val = float(pays_final["value"])
+                else:
+                    pays_prev_val = float(pays_prev)
+                    pays_final_val = float(pays_final)
+                taker_pays_transferred = pays_prev_val - pays_final_val
+            except Exception:
+                taker_pays_transferred = None
+        # Compute quality (price)
+        if taker_gets_transferred and taker_pays_transferred and taker_gets_transferred != 0:
+            try:
+                quality = taker_pays_transferred / taker_gets_transferred
+            except Exception:
+                quality = None
+    return {
+        "quality": quality,
+        "taker_gets_transferred": taker_gets_transferred,
+        "taker_pays_transferred": taker_pays_transferred,
+    }

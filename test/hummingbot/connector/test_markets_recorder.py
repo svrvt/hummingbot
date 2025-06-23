@@ -1,8 +1,8 @@
 import asyncio
 import time
 from decimal import Decimal
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Awaitable
-from unittest import TestCase
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
@@ -22,14 +22,21 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.executors import Executors
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.order import Order
+from hummingbot.model.position import Position
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
-class MarketsRecorderTests(TestCase):
+class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
     @staticmethod
     def create_mock_strategy():
         market = MagicMock()
@@ -434,3 +441,248 @@ class MarketsRecorderTests(TestCase):
         self.assertEqual(market_data[0].best_ask, Decimal("101"))
         self.assertEqual(market_data[0].best_bid, Decimal("99"))
         self.assertEqual(market_data[0].mid_price, Decimal("100"))
+
+    def test_store_position(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        position = Position(id="123", timestamp=123, controller_id="test_controller", connector_name="binance",
+                            trading_pair="ETH-USDT", side=TradeType.BUY.name, amount=Decimal("1"), breakeven_price=Decimal("1000"),
+                            unrealized_pnl_quote=Decimal("0"), cum_fees_quote=Decimal("0"),
+                            volume_traded_quote=Decimal("10"))
+        recorder.store_position(position)
+        with self.manager.get_new_session() as session:
+            query = session.query(Position)
+            positions = query.all()
+        self.assertEqual(1, len(positions))
+
+    def test_update_or_store_position(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Test inserting a new position
+        position1 = Position(
+            id="123",
+            timestamp=123,
+            controller_id="test_controller",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("1"),
+            breakeven_price=Decimal("1000"),
+            unrealized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("10")
+        )
+        recorder.update_or_store_position(position1)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(Position)
+            positions = query.all()
+        self.assertEqual(1, len(positions))
+        self.assertEqual(Decimal("1"), positions[0].amount)
+        self.assertEqual(Decimal("1000"), positions[0].breakeven_price)
+        self.assertEqual(Decimal("10"), positions[0].volume_traded_quote)
+
+        # Test updating an existing position with same controller_id, connector, trading_pair, and side
+        position2 = Position(
+            id="456",  # Different ID (this will be ignored for existing positions)
+            timestamp=456,  # New timestamp
+            controller_id="test_controller",  # Same controller
+            connector_name="binance",  # Same connector
+            trading_pair="ETH-USDT",  # Same trading pair
+            side=TradeType.BUY.name,  # Same side
+            amount=Decimal("2"),  # Updated amount
+            breakeven_price=Decimal("1100"),  # Updated price
+            unrealized_pnl_quote=Decimal("100"),  # Updated PnL
+            cum_fees_quote=Decimal("5"),  # Updated fees
+            volume_traded_quote=Decimal("30")  # Updated volume
+        )
+        recorder.update_or_store_position(position2)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(Position)
+            positions = query.all()
+        # Should still be only 1 position (updated, not inserted)
+        self.assertEqual(1, len(positions))
+        self.assertEqual(Decimal("2"), positions[0].amount)
+        self.assertEqual(Decimal("1100"), positions[0].breakeven_price)
+        self.assertEqual(Decimal("100"), positions[0].unrealized_pnl_quote)
+        self.assertEqual(Decimal("5"), positions[0].cum_fees_quote)
+        self.assertEqual(Decimal("30"), positions[0].volume_traded_quote)
+        self.assertEqual(456, positions[0].timestamp)
+
+        # Test inserting a new position with different side
+        position3 = Position(
+            id="789",
+            timestamp=789,
+            controller_id="test_controller",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.SELL.name,  # Different side
+            amount=Decimal("0.5"),
+            breakeven_price=Decimal("1200"),
+            unrealized_pnl_quote=Decimal("-50"),
+            cum_fees_quote=Decimal("2"),
+            volume_traded_quote=Decimal("15")
+        )
+        recorder.update_or_store_position(position3)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(Position)
+            positions = query.all()
+        # Should now have 2 positions (one BUY, one SELL)
+        self.assertEqual(2, len(positions))
+
+        # Test inserting a new position with different trading pair
+        position4 = Position(
+            id="1011",
+            timestamp=1011,
+            controller_id="test_controller",
+            connector_name="binance",
+            trading_pair="BTC-USDT",  # Different trading pair
+            side=TradeType.BUY.name,
+            amount=Decimal("0.1"),
+            breakeven_price=Decimal("50000"),
+            unrealized_pnl_quote=Decimal("500"),
+            cum_fees_quote=Decimal("10"),
+            volume_traded_quote=Decimal("5000")
+        )
+        recorder.update_or_store_position(position4)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(Position)
+            positions = query.all()
+        # Should now have 3 positions
+        self.assertEqual(3, len(positions))
+
+    def test_get_positions_methods(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Create test positions
+        position1 = Position(
+            id="pos1",
+            timestamp=123,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("1"),
+            breakeven_price=Decimal("1000"),
+            unrealized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("10")
+        )
+        position2 = Position(
+            id="pos2",
+            timestamp=124,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="BTC-USDT",
+            side=TradeType.SELL.name,
+            amount=Decimal("0.1"),
+            breakeven_price=Decimal("50000"),
+            unrealized_pnl_quote=Decimal("100"),
+            cum_fees_quote=Decimal("5"),
+            volume_traded_quote=Decimal("5000")
+        )
+        position3 = Position(
+            id="pos3",
+            timestamp=125,
+            controller_id="controller2",
+            connector_name="kucoin",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("2"),
+            breakeven_price=Decimal("1100"),
+            unrealized_pnl_quote=Decimal("-50"),
+            cum_fees_quote=Decimal("2"),
+            volume_traded_quote=Decimal("20")
+        )
+
+        recorder.store_position(position1)
+        recorder.store_position(position2)
+        recorder.store_position(position3)
+
+        # Test get_all_positions
+        all_positions = recorder.get_all_positions()
+        self.assertEqual(3, len(all_positions))
+        self.assertIn("pos1", [p.id for p in all_positions])
+        self.assertIn("pos2", [p.id for p in all_positions])
+        self.assertIn("pos3", [p.id for p in all_positions])
+
+        # Test get_positions_by_controller
+        controller1_positions = recorder.get_positions_by_controller("controller1")
+        self.assertEqual(2, len(controller1_positions))
+        self.assertIn("pos1", [p.id for p in controller1_positions])
+        self.assertIn("pos2", [p.id for p in controller1_positions])
+
+        controller2_positions = recorder.get_positions_by_controller("controller2")
+        self.assertEqual(1, len(controller2_positions))
+        self.assertEqual("pos3", controller2_positions[0].id)
+
+        # Test get_positions_by_ids
+        positions_by_ids = recorder.get_positions_by_ids(["pos1", "pos3"])
+        self.assertEqual(2, len(positions_by_ids))
+        self.assertIn("pos1", [p.id for p in positions_by_ids])
+        self.assertIn("pos3", [p.id for p in positions_by_ids])
+        self.assertNotIn("pos2", [p.id for p in positions_by_ids])
+
+    def test_store_or_update_executor(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+        position_executor_mock = MagicMock(spec=PositionExecutor)
+        position_executor_config = PositionExecutorConfig(
+            id="123", timestamp=1234, trading_pair="ETH-USDT", connector_name="binance", side=TradeType.BUY,
+            entry_price=Decimal("1000"), amount=Decimal("1"), leverage=1,
+            triple_barrier_config=TripleBarrierConfig(take_profit=Decimal("0.1"), stop_loss=Decimal("0.2")),
+        )
+        position_executor_mock.config = position_executor_config
+        position_executor_mock.executor_info = ExecutorInfo(
+            id="123", timestamp=1234, type="position_executor", close_timestamp=1235, close_type=CloseType.TAKE_PROFIT,
+            status=RunnableStatus.TERMINATED, controller_id="test_controller", custom_info={},
+            config=position_executor_config, net_pnl_pct=Decimal("0.1"), net_pnl_quote=Decimal("10"),
+            cum_fees_quote=Decimal("0.1"), filled_amount_quote=Decimal("1"), is_active=False, is_trading=False)
+
+        recorder.store_or_update_executor(position_executor_mock)
+        with self.manager.get_new_session() as session:
+            query = session.query(Executors)
+            executors = query.all()
+        self.assertEqual(1, len(executors))

@@ -172,7 +172,9 @@ class CandlesBase(NetworkBase):
                 candles = await self.fetch_candles(start_time=current_start_time,
                                                    end_time=current_end_time,
                                                    limit=missing_records)
-                if candles.size <= 1 or missing_records == 0:
+                if len(candles) <= 1 or missing_records == 0:
+                    fetched_candles_df = pd.DataFrame(candles, columns=self.columns)
+                    candles_df = pd.concat([fetched_candles_df, candles_df])
                     break
                 candles = candles[candles[:, 0] <= current_end_time]
                 current_end_time = self.ensure_timestamp_in_seconds(candles[0][0])
@@ -181,8 +183,7 @@ class CandlesBase(NetworkBase):
                 candles_df.drop_duplicates(subset=["timestamp"], inplace=True)
                 candles_df.reset_index(drop=True, inplace=True)
                 self.check_candles_sorted_and_equidistant(candles_df.values)
-            candles_df = candles_df[
-                (candles_df["timestamp"] <= config.end_time) & (candles_df["timestamp"] >= config.start_time)]
+            candles_df = candles_df[(candles_df["timestamp"] <= config.end_time) & (candles_df["timestamp"] >= config.start_time)]
             return candles_df
         except ValueError as e:
             self.logger().error(f"Error fetching historical candles: {str(e)}")
@@ -196,9 +197,9 @@ class CandlesBase(NetworkBase):
         This method checks if the given candles are sorted by timestamp in ascending order and equidistant.
         :param candles: numpy array with the candles
         """
-        timestamps = [candle[0] for candle in candles]
         if len(self._candles) <= 1:
             return
+        timestamps = candles[:, 0].astype(float)
         if not np.all(np.diff(timestamps) >= 0):
             self.logger().warning("Candles are not sorted by timestamp in ascending order.")
             self._reset_candles()
@@ -340,7 +341,7 @@ class CandlesBase(NetworkBase):
                     "Unexpected error occurred when getting historical klines. Retrying in 1 seconds...",
                 )
                 await self._sleep(1.0)
-        self.check_candles_sorted_and_equidistant(self._candles)
+        self.check_candles_sorted_and_equidistant(np.array(self._candles))
 
     async def listen_for_subscriptions(self):
         """

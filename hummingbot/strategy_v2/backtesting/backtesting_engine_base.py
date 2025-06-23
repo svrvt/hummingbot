@@ -2,21 +2,21 @@ import importlib
 import inspect
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Type, Union
 
 import numpy as np
 import pandas as pd
 import yaml
 
 from hummingbot.client import settings
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import LazyDict, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.exceptions import InvalidController
 from hummingbot.strategy_v2.backtesting.backtesting_data_provider import BacktestingDataProvider
 from hummingbot.strategy_v2.backtesting.executor_simulator_base import ExecutorSimulation
 from hummingbot.strategy_v2.backtesting.executors_simulator.dca_executor_simulator import DCAExecutorSimulator
 from hummingbot.strategy_v2.backtesting.executors_simulator.position_executor_simulator import PositionExecutorSimulator
-from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
+from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerConfigBase,
 )
@@ -30,6 +30,8 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
 class BacktestingEngineBase:
+    __controller_class_cache = LazyDict[str, Type[ControllerBase]]()
+
     def __init__(self):
         self.controller = None
         self.backtesting_resolution = None
@@ -82,8 +84,9 @@ class BacktestingEngineBase:
                               start: int, end: int,
                               backtesting_resolution: str = "1m",
                               trade_cost=0.0006):
+        controller_class = self.__controller_class_cache.get_or_add(controller_config.controller_name, controller_config.get_controller_class)
+        # controller_class = controller_config.get_controller_class()
         # Load historical candles
-        controller_class = controller_config.get_controller_class()
         self.backtesting_data_provider.update_backtesting_time(start, end)
         await self.backtesting_data_provider.initialize_trading_rules(controller_config.connector_name)
         self.controller = controller_class(config=controller_config, market_data_provider=self.backtesting_data_provider,
@@ -123,18 +126,23 @@ class BacktestingEngineBase:
         self.active_executor_simulations: List[ExecutorSimulation] = []
         self.stopped_executors_info: List[ExecutorInfo] = []
         for i, row in processed_features.iterrows():
-            self.update_market_data(row)
-            await self.update_processed_data(row)
-            self.update_executors_info(row["timestamp"])
+            await self.update_state(row)
             for action in self.controller.determine_executor_actions():
                 if isinstance(action, CreateExecutorAction):
                     executor_simulation = self.simulate_executor(action.executor_config, processed_features.loc[i:], trade_cost)
-                    if executor_simulation.close_type != CloseType.FAILED:
+                    if executor_simulation is not None and executor_simulation.close_type != CloseType.FAILED:
                         self.manage_active_executors(executor_simulation)
                 elif isinstance(action, StopExecutorAction):
                     self.handle_stop_action(action, row["timestamp"])
 
         return self.controller.executors_info
+
+    async def update_state(self, row):
+        key = f"{self.controller.config.connector_name}_{self.controller.config.trading_pair}"
+        self.controller.market_data_provider.prices = {key: Decimal(row["close_bt"])}
+        self.controller.market_data_provider._time = row["timestamp"]
+        self.controller.processed_data.update(row.to_dict())
+        self.update_executors_info(row["timestamp"])
 
     def update_executors_info(self, timestamp: float):
         active_executors_info = []
@@ -179,7 +187,10 @@ class BacktestingEngineBase:
             backtesting_candles = pd.merge_asof(backtesting_candles, self.controller.processed_data["features"],
                                                 left_on="timestamp_bt", right_on="timestamp",
                                                 direction="backward")
+
         backtesting_candles["timestamp"] = backtesting_candles["timestamp_bt"]
+        # Set timestamp as index to allow index slicing for performance
+        backtesting_candles = BacktestingDataProvider.ensure_epoch_index(backtesting_candles)
         backtesting_candles["open"] = backtesting_candles["open_bt"]
         backtesting_candles["high"] = backtesting_candles["high_bt"]
         backtesting_candles["low"] = backtesting_candles["low_bt"]
@@ -188,18 +199,6 @@ class BacktestingEngineBase:
         backtesting_candles.dropna(inplace=True)
         self.controller.processed_data["features"] = backtesting_candles
         return backtesting_candles
-
-    def update_market_data(self, row: pd.Series):
-        """
-        Updates market data in the controller with the current price and timestamp.
-
-        Args:
-            row (pd.Series): The current row of market data.
-        """
-        connector_name = self.controller.config.connector_name
-        trading_pair = self.controller.config.trading_pair
-        self.controller.market_data_provider.prices = {f"{connector_name}_{trading_pair}": Decimal(row["close_bt"])}
-        self.controller.market_data_provider._time = row["timestamp"]
 
     def simulate_executor(self, config: Union[PositionExecutorConfig, DCAExecutorConfig], df: pd.DataFrame,
                           trade_cost: float) -> Optional[ExecutorSimulation]:
@@ -231,7 +230,7 @@ class BacktestingEngineBase:
         if not simulation.executor_simulation.empty:
             self.active_executor_simulations.append(simulation)
 
-    def handle_stop_action(self, action: StopExecutorAction, timestamp: pd.Timestamp):
+    def handle_stop_action(self, action: StopExecutorAction, timestamp: float):
         """
         Handles stop actions for executors, terminating them as required.
 
@@ -272,7 +271,7 @@ class BacktestingEngineBase:
             total_positions = executors_with_position.shape[0]
             win_signals = executors_with_position[executors_with_position["net_pnl_quote"] > 0]
             loss_signals = executors_with_position[executors_with_position["net_pnl_quote"] < 0]
-            accuracy = win_signals.shape[0] / total_positions
+            accuracy = (win_signals.shape[0] / total_positions) if total_positions else 0.0
             cumulative_returns = executors_with_position["net_pnl_quote"].cumsum()
             executors_with_position["cumulative_returns"] = cumulative_returns
             executors_with_position["cumulative_volume"] = executors_with_position["filled_amount_quote"].cumsum()
